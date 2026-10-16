@@ -53,48 +53,39 @@ function runRouth()
         end
         fprintf('\nActual order of the system = %d\n', n);
 
-        [R, special, zeroRows] = routhNumeric(S);
-        cols = size(R, 2);
+        A = analyzePoly(S);
+        printRouthTable(A.R, A.n, A.info);
+        printAux(A.info, A.n);
 
-        fprintf('\nRouth Table:\n');
-        for i = 1:n+1
-            fprintf('S^%-2d |', n-i+1);
-            fprintf(' %12.4f', R(i, 1:cols-1));
-            fprintf('\n');
-        end
-
-        firstCol = R(:,1);
-        sg = sign(firstCol);
-        numRHP = countChanges(sg);
-        numImag = 0;
-        for i = zeroRows
-            degAux = n - i + 2;
-            numImag = numImag + (degAux - 2*countChanges(sg(i-1:end)));
-        end
-        numLHP = n - numRHP - numImag;
-
-        fprintf('\nFirst column: %s\n', mat2str(firstCol', 4));
+        fprintf('\nFirst column: %s\n', mat2str(A.R(:,1)', 4));
         fprintf('\nFrom Routh table:\n');
-        fprintf('  Poles in RHP            = %d\n', numRHP);
-        fprintf('  Poles on imaginary axis = %d\n', numImag);
-        fprintf('  Poles in LHP            = %d\n', numLHP);
+        fprintf('  Poles in RHP            = %d\n', A.numRHP);
+        fprintf('  Poles on imaginary axis = %d\n', A.numImag);
+        fprintf('  Poles in LHP            = %d\n', A.numLHP);
 
-        if numRHP > 0
+        r = roots(S);
+        tol = 1e-6;
+        repeated = hasRepeatedImag(r);
+
+        if A.numRHP > 0
             resultTxt = 'UNSTABLE';
-        elseif numImag > 0 || special
+        elseif A.numImag > 0 && repeated
+            resultTxt = 'UNSTABLE (repeated poles on jw axis)';
+        elseif A.numImag > 0
             resultTxt = 'MARGINALLY STABLE';
         else
             resultTxt = 'STABLE';
         end
         fprintf('Result: system is %s\n', resultTxt);
 
-        r = roots(S);
-        tol = 1e-6;
         fprintf('\nVerification with roots():\n');
         disp(r);
-        fprintf('  RHP = %d | Imag axis = %d | LHP = %d\n', ...
-            sum(real(r) > tol), sum(abs(real(r)) <= tol), sum(real(r) < -tol));
-        plotPoles(r, resultTxt, numRHP);
+        nR = sum(real(r) > tol);  nI = sum(abs(real(r)) <= tol);  nL = sum(real(r) < -tol);
+        fprintf('  RHP = %d | Imag axis = %d | LHP = %d\n', nR, nI, nL);
+        if nR ~= A.numRHP || nI ~= A.numImag
+            fprintf('  Warning: roots() disagrees with the Routh counts (numerical sensitivity near the jw axis).\n');
+        end
+        plotPoles(r, resultTxt, A.numRHP);
 
     else
         if isempty(ver('symbolic'))
@@ -123,7 +114,7 @@ function runRouth()
             end
         end
 
-        while numel(S) > 1 && isAlways(S(1) == 0)
+        while numel(S) > 1 && symZero(S(1))
             S(1) = [];
         end
         n = numel(S) - 1;
@@ -131,49 +122,83 @@ function runRouth()
             disp('The polynomial reduces to a constant: nothing to analyze.');
             return;
         end
-        if ~isempty(symvar(S(1)))
-            disp('Note: the leading coefficient depends on K, results are valid only where it is non-zero.');
+        levelNote = ~isempty(symvar(S(1)));
+        if levelNote
+            disp('Note: the leading coefficient depends on K; the order drops at the K that makes it zero.');
         end
 
+        % ---------- symbolic Routh table (stops if a pivot is identically zero) ----------
         cols = ceil((n+1)/2) + 1;
         R = sym(zeros(n+1, cols));
         r1 = S(1:2:end);  R(1, 1:numel(r1)) = r1;
         r2 = S(2:2:end);  R(2, 1:numel(r2)) = r2;
-        try
-            for i = 3:n+1
-                for j = 1:cols-1
-                    R(i,j) = simplify((R(i-1,1)*R(i-2,j+1) - R(i-2,1)*R(i-1,j+1)) / R(i-1,1));
-                end
+        lastRow = n + 1;
+        tableOK = true;
+        for i = 3:n+1
+            piv = R(i-1,1);
+            if symZero(piv)
+                tableOK = false;  lastRow = i - 1;  break;
             end
-        catch
-            disp('The table hit a division by zero for every K (special case not supported in K mode).');
-            return;
+            for j = 1:cols-1
+                R(i,j) = simplify((piv*R(i-2,j+1) - R(i-2,1)*R(i-1,j+1)) / piv);
+            end
         end
-        firstCol = simplify(R(:,1));
+        firstCol = simplify(R(1:lastRow, 1));
 
         fprintf('\nFirst column of the Routh table:\n');
-        for i = 1:n+1
+        for i = 1:lastRow
             fprintf('S^%-2d | ', n-i+1);
             disp(firstCol(i));
         end
+        if ~tableOK
+            fprintf(['\nSpecial case: the pivot of row S^%d is zero for EVERY K (zero row / zero pivot).\n' ...
+                     'The symbolic table stops here; stability is checked numerically for each K range,\n' ...
+                     'using the epsilon / auxiliary-polynomial rules.\n'], n-lastRow+1);
+        end
 
+        % ---------- critical K values ----------
         crit = [];
-        for i = 1:n+1
-            [nu, de] = numden(firstCol(i));
-            for e = {nu, de}
-                ex = e{1};
-                if ~isempty(symvar(ex))
-                    try
+        % (a) K where a first-column element is zero or its denominator is zero
+        for i = 1:lastRow
+            try
+                [nu, de] = numden(firstCol(i));
+                for e = {nu, de}
+                    ex = e{1};
+                    if ~isempty(symvar(ex))
                         sol = double(solve(ex == 0, K));
                         sol = sol(abs(imag(sol)) < 1e-9);
                         crit = [crit; real(sol(:))]; %#ok<AGROW>
-                    catch
                     end
                 end
+            catch
             end
         end
-        crit = unique(round(crit, 8));
+        % (b) K where the leading coefficient vanishes
+        if levelNote
+            try
+                sol = double(solve(S(1) == 0, K));
+                sol = sol(abs(imag(sol)) < 1e-9);
+                crit = [crit; real(sol(:))]; %#ok<AGROW>
+            catch
+            end
+        end
+        % (c) K where a root sits on the jw axis (solve P(jw) = 0 for w and K)
+        try
+            syms w real
+            Pjw = expand(sum(S .* (1j*w).^(n:-1:0)));
+            sol = solve([real(Pjw) == 0, imag(Pjw) == 0], [w K], 'Real', true);
+            if isstruct(sol)
+                wv = double(sol.w);  Kv = double(sol.K);
+            else
+                wv = double(sol(:,1));  Kv = double(sol(:,2));
+            end
+            okv = isfinite(wv) & isfinite(Kv) & abs(imag(wv)) < 1e-9 & abs(imag(Kv)) < 1e-9;
+            crit = [crit; real(Kv(okv))]; %#ok<AGROW>
+        catch
+        end
+        crit = unique(round(crit(isfinite(crit)), 8));
 
+        % ---------- stability by K range (numeric Routh with all special cases) ----------
         edges = [-inf; crit(:); inf];
         fprintf('\nStability by K range:\n');
         stableIdx = [];
@@ -184,14 +209,8 @@ function runRouth()
             elseif isinf(hi),          pt = lo + 1;
             else,                      pt = (lo + hi) / 2;
             end
-            vals = double(subs(firstCol, K, pt));
-            ch = countChanges(sign(vals));
-            if (ch == 0) && all(vals ~= 0)
-                stableIdx(end+1) = k; %#ok<AGROW>
-                st = 'STABLE';
-            else
-                st = sprintf('UNSTABLE (%d RHP poles)', ch);
-            end
+            [isSt, st] = evalAtK(S, K, pt);
+            if isSt, stableIdx(end+1) = k; end %#ok<AGROW>
             fprintf('  %s : %s\n', rangeStr(lo, hi), st);
         end
 
@@ -204,23 +223,51 @@ function runRouth()
             end
         end
 
+        % ---------- behaviour exactly at each critical K ----------
         if ~isempty(crit)
             fprintf('\nCritical K values:\n');
             for kc = crit(:)'
                 try
-                    rr = roots(double(subs(S, K, kc)));
-                    if any(abs(real(rr)) < 1e-6)
-                        fprintf('  K = %.6g -> marginally stable (poles on imaginary axis)\n', kc);
+                    c = double(subs(S, K, kc));
+                    c = trimLead(c);
+                    Ac = analyzePoly(c);
+                    rr = roots(c);
+                    onAx = rr(abs(real(rr)) <= 1e-6);
+                    wj = unique(round(abs(imag(onAx)), 6));
+                    if Ac.numRHP > 0
+                        fprintf('  K = %.6g -> UNSTABLE (%d RHP poles)\n', kc, Ac.numRHP);
+                    elseif Ac.numImag > 0
+                        fprintf('  K = %.6g -> MARGINALLY STABLE, poles on jw axis at w = %s rad/s\n', ...
+                                kc, mat2str(wj', 5));
                     else
-                        fprintf('  K = %.6g -> first-column element changes sign\n', kc);
+                        fprintf('  K = %.6g -> stable (a first-column element changes sign here)\n', kc);
                     end
                 catch
-                    fprintf('  K = %.6g\n', kc);
+                    fprintf('  K = %.6g (could not be analyzed)\n', kc);
                 end
             end
         end
-        fprintf('\nNote: mode 2 assumes no zero-row special case inside the table.\n');
     end
+end
+
+function [isStable, txt] = evalAtK(S, K, pt)
+    try
+        c = double(subs(S, K, pt));
+        A = analyzePoly(c);
+        if A.numRHP == 0 && A.numImag == 0
+            isStable = true;   txt = 'STABLE';
+        elseif A.numRHP == 0
+            isStable = false;  txt = 'MARGINALLY STABLE';
+        else
+            isStable = false;  txt = sprintf('UNSTABLE (%d RHP poles)', A.numRHP);
+        end
+    catch
+        isStable = false;  txt = 'could not be evaluated';
+    end
+end
+
+function tf = symZero(x)
+    tf = isequal(simplify(sym(x)), sym(0));
 end
 
 %% ===================================================================
@@ -922,41 +969,118 @@ function c = countChanges(sg)
     c = sum(sg(1:end-1) .* sg(2:end) < 0);
 end
 
-function [R, special, zeroRows] = routhNumeric(S)
+function s = rangeStr(lo, hi)
+    if isinf(lo) && isinf(hi), s = 'all K';
+    elseif isinf(lo),          s = sprintf('K < %.6g', hi);
+    elseif isinf(hi),          s = sprintf('K > %.6g', lo);
+    else,                      s = sprintf('%.6g < K < %.6g', lo, hi);
+    end
+end
+
+%% ===================================================================
+%              ROUTH ENGINE (with all special cases)
+%% ===================================================================
+function A = analyzePoly(S)
+    % Runs the numeric Routh test and counts RHP / jw-axis / LHP poles.
+    S = trimLead(S);
+    n = numel(S) - 1;
+    if n < 1, error('Polynomial must be of order 1 or higher.'); end
+    [R, special, info] = routhNumeric(S);
+    sg = sign(R(:,1));
+    numRHP = countChanges(sg);
+    numImag = 0;
+    for i = info.zeroRows
+        degAux = n - i + 2;                                  % degree of the auxiliary polynomial
+        numImag = numImag + (degAux - 2*countChanges(sg(i-1:end)));
+    end
+    numImag = max(numImag, 0);
+    A = struct('S', S, 'n', n, 'R', R, 'special', special, 'info', info, ...
+               'numRHP', numRHP, 'numImag', numImag, 'numLHP', n - numRHP - numImag);
+end
+
+function [R, special, info] = routhNumeric(S)
+    % Special case 1: first element of a row is 0 (row not all zero) -> replace by eps.
+    % Special case 2: whole row is 0 -> replace by the derivative of the auxiliary polynomial.
     n = numel(S) - 1;
     cols = ceil((n+1)/2) + 1;
-    epsVal = 1e-6;
+    scale = max(abs(S));
+    epsVal = 1e-6 * scale;
     special = false;
-    zeroRows = [];
+    info = struct('zeroRows', [], 'epsRows', [], 'aux', {{}}, 'epsVal', epsVal);
+
     R = zeros(n+1, cols);
     r1 = S(1:2:end);  R(1, 1:numel(r1)) = r1;
     r2 = S(2:2:end);  R(2, 1:numel(r2)) = r2;
+
     for i = 2:n+1
         if i >= 3
             for j = 1:cols-1
                 R(i,j) = (R(i-1,1)*R(i-2,j+1) - R(i-2,1)*R(i-1,j+1)) / R(i-1,1);
             end
         end
-        if all(abs(R(i,:)) < 1e-12)          % zero row -> auxiliary polynomial
+        tolz = 1e-9 * max(max(abs(R(max(i-2,1):i-1, :))));   % tolerance relative to the rows above
+
+        if all(abs(R(i,:)) <= tolz)                  % ---- zero row ----
             special = true;
-            zeroRows(end+1) = i; %#ok<AGROW>
-            pw = n - i + 1;
+            d = n - i + 2;                           % degree of auxiliary polynomial A(S)
+            aux = zeros(1, d+1);
             for j = 1:cols
-                R(i,j) = (pw + 1 - 2*(j-1)) * R(i-1,j);
+                idx = 1 + 2*(j-1);
+                if idx <= d+1, aux(idx) = R(i-1,j); end
+            end
+            info.zeroRows(end+1) = i;
+            info.aux{end+1} = aux;
+            for j = 1:cols                           % dA/dS coefficients
+                R(i,j) = (d - 2*(j-1)) * R(i-1,j);
             end
         end
-        if abs(R(i,1)) < 1e-12 && i < n+1    % zero first element -> epsilon
+
+        if abs(R(i,1)) <= tolz && i < n+1            % ---- zero first element ----
             special = true;
             R(i,1) = epsVal;
+            info.epsRows(end+1) = i;
         end
     end
 end
 
-function s = rangeStr(lo, hi)
-    if isinf(lo) && isinf(hi), s = 'all K';
-    elseif isinf(lo),          s = sprintf('K < %.6g', hi);
-    elseif isinf(hi),          s = sprintf('K > %.6g', lo);
-    else,                      s = sprintf('%.6g < K < %.6g', lo, hi);
+function printRouthTable(R, n, info)
+    cols = size(R, 2);
+    fprintf('\nRouth Table:\n');
+    for i = 1:n+1
+        fprintf('S^%-2d |', n-i+1);
+        fprintf(' %12.4g', R(i, 1:cols-1));
+        if ismember(i, info.epsRows)
+            fprintf('   <- first element was 0, replaced by eps = %.2g', info.epsVal);
+        end
+        if ismember(i, info.zeroRows)
+            fprintf('   <- zero row, replaced by dA/dS');
+        end
+        fprintf('\n');
+    end
+end
+
+function printAux(info, n)
+    for k = 1:numel(info.aux)
+        a = info.aux{k};
+        i = info.zeroRows(k);
+        fprintf('\nZero row at S^%d -> auxiliary polynomial A(S) (degree %d) coefficients: %s\n', ...
+                n-i+1, numel(a)-1, mat2str(a, 5));
+        rr = roots(a);
+        fprintf('Roots of A(S):\n');
+        for q = 1:numel(rr), fprintf('   %s\n', fmtC(rr(q))); end
+    end
+end
+
+function tf = hasRepeatedImag(r)
+    % true if two (or more) poles sit on top of each other on the jw axis
+    ir = r(abs(real(r)) <= 1e-6);
+    tf = false;
+    for a = 1:numel(ir)-1
+        for b = a+1:numel(ir)
+            if abs(ir(a) - ir(b)) < 1e-3*max(1, abs(ir(a)))
+                tf = true;  return;
+            end
+        end
     end
 end
 
